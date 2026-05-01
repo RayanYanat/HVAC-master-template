@@ -1,0 +1,64 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500&family=Syne:wght@700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html {
+    scroll-behavior: auto; /* we control scroll manually */
+    height: 100%;
+  }
+
+  body {
+    background: #0d0500;
+    color: #f5efe8;
+    font-family: 'Inter', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow-x: hidden;
+  }
+
+  ::selection { background: rgba(56, 189, 248, 0.25); }
+}
+
+@layer utilities {
+  .font-syne   { font-family: 'Syne', sans-serif; }
+  .font-inter  { font-family: 'Inter', sans-serif; }
+
+  /* Heat distortion shimmer on the hero */
+  @keyframes heatWave {
+    0%   { filter: blur(0px) brightness(1);    transform: scaleY(1);    }
+    30%  { filter: blur(0.6px) brightness(1.04); transform: scaleY(1.003); }
+    60%  { filter: blur(0.3px) brightness(0.98); transform: scaleY(0.998); }
+    100% { filter: blur(0px) brightness(1);    transform: scaleY(1);    }
+  }
+  .heat-shimmer { animation: heatWave 4s ease-in-out infinite; transform-origin: bottom; }
+
+  /* Floating airflow particles */
+  @keyframes drift {
+    0%   { transform: translateX(0)   translateY(0)   scale(1);   opacity: 0; }
+    10%  { opacity: 1; }
+    85%  { opacity: 0.6; }
+    100% { transform: translateX(var(--tx)) translateY(var(--ty)) scale(0.6); opacity: 0; }
+  }
+  .particle { animation: drift var(--dur) var(--delay) ease-in-out infinite; }
+
+  /* Wave path animation */
+  @keyframes wavePath {
+    0%   { d: path('M0,60 C200,30 400,90 600,60 C800,30 1000,90 1200,60 C1400,30 1600,60 1600,60'); }
+    50%  { d: path('M0,60 C200,90 400,30 600,60 C800,90 1000,30 1200,60 C1400,90 1600,60 1600,60'); }
+    100% { d: path('M0,60 C200,30 400,90 600,60 C800,30 1000,90 1200,60 C1400,30 1600,60 1600,60'); }
+  }
+
+  /* Soft pulse */
+  @keyframes softPulse {
+    0%, 100% { opacity: 0.5; transform: scale(1); }
+    50%       { opacity: 0.9; transform: scale(1.02); }
+  }
+  .soft-pulse { animation: softPulse 4s ease-in-out infinite; }
+
+  /* Scroll-driven global BG color is set via inline style on a fixed layer */
+}
