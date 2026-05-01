@@ -1,397 +1,448 @@
-import { useEffect, useRef, useState, useMemo } from 'react';
-import { motion, useScroll, useTransform, useSpring, useMotionValue, useAnimationFrame } from 'framer-motion';
+import {
+  useEffect, useRef, useState, useMemo, useCallback,
+} from 'react';
+import {
+  motion, useScroll, useTransform, useSpring,
+  useAnimationFrame, useMotionValue,
+} from 'framer-motion';
 
-// ─────────────────────────────────────────────────────────────────────
-// Colour palette & interpolation
-// ─────────────────────────────────────────────────────────────────────
-// scroll 0 → 1 maps hot → cold
-// We define colour stops at scroll positions 0, 0.2, 0.45, 0.7, 1.0
-
+// ─── Colour system ────────────────────────────────────────────────────
 function hexToRgb(hex: string): [number, number, number] {
   const n = parseInt(hex.replace('#', ''), 16);
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
-function lerpColor(a: string, b: string, t: number): string {
+function lerpHex(a: string, b: string, t: number): string {
   const [ar, ag, ab] = hexToRgb(a);
   const [br, bg, bb] = hexToRgb(b);
-  const r = Math.round(ar + (br - ar) * t);
-  const g = Math.round(ag + (bg - ag) * t);
-  const bl = Math.round(ab + (bb - ab) * t);
-  return `rgb(${r},${g},${bl})`;
+  return `rgb(${Math.round(ar+(br-ar)*t)},${Math.round(ag+(bg-ag)*t)},${Math.round(ab+(bb-ab)*t)})`;
 }
+function clamp01(v: number) { return Math.max(0, Math.min(1, v)); }
 
-const STOPS: Array<{ pos: number; bg: string; text: string }> = [
-  { pos: 0,    bg: '#1a0600', text: '#fff2e0' },
-  { pos: 0.18, bg: '#1a0a00', text: '#fff0d5' },
-  { pos: 0.38, bg: '#0d1218', text: '#e8f4f8' },
-  { pos: 0.60, bg: '#041220', text: '#d6eeff' },
-  { pos: 0.80, bg: '#030e1c', text: '#cce8ff' },
-  { pos: 1.00, bg: '#020b18', text: '#c8e8ff' },
+const BG_STOPS = [
+  { p: 0.00, c: '#120800' },
+  { p: 0.15, c: '#160a02' },
+  { p: 0.35, c: '#0a1018' },
+  { p: 0.55, c: '#050e1c' },
+  { p: 0.75, c: '#040c1a' },
+  { p: 1.00, c: '#030b18' },
 ];
-
-function interpolateStops(p: number, key: 'bg' | 'text'): string {
-  for (let i = 0; i < STOPS.length - 1; i++) {
-    const a = STOPS[i], b = STOPS[i + 1];
-    if (p >= a.pos && p <= b.pos) {
-      const t = (p - a.pos) / (b.pos - a.pos);
-      return lerpColor(a[key], b[key], t);
-    }
+function bgAt(p: number): string {
+  for (let i = 0; i < BG_STOPS.length - 1; i++) {
+    const a = BG_STOPS[i], b = BG_STOPS[i + 1];
+    if (p <= b.p) return lerpHex(a.c, b.c, (p - a.p) / (b.p - a.p));
   }
-  return STOPS[STOPS.length - 1][key];
+  return BG_STOPS[BG_STOPS.length - 1].c;
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Global scroll progress context
-// ─────────────────────────────────────────────────────────────────────
+// ─── Global scroll hook ───────────────────────────────────────────────
 function usePageScroll() {
   const { scrollYProgress } = useScroll();
-  return useSpring(scrollYProgress, { stiffness: 60, damping: 20, restDelta: 0.001 });
+  return useSpring(scrollYProgress, { stiffness: 55, damping: 22, restDelta: 0.001 });
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Fixed full-page background — reacts to scroll colour
-// ─────────────────────────────────────────────────────────────────────
-function ScrollBackground({ progress }: { progress: ReturnType<typeof useSpring> }) {
-  const [color, setColor] = useState(STOPS[0].bg);
-
+// ─── Scroll velocity hook (for motion blur) ───────────────────────────
+function useScrollVelocity() {
+  const vel = useMotionValue(0);
+  const lastY = useRef(0);
+  const lastT = useRef(0);
   useEffect(() => {
-    return progress.on('change', (v) => setColor(interpolateStops(v, 'bg')));
-  }, [progress]);
-
-  return (
-    <div
-      className="fixed inset-0 -z-10 transition-none"
-      style={{ background: color }}
-    />
-  );
+    const onScroll = () => {
+      const now = performance.now();
+      const dy = window.scrollY - lastY.current;
+      const dt = now - lastT.current || 16;
+      vel.set(dy / dt); // px/ms
+      lastY.current = window.scrollY;
+      lastT.current = now;
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, [vel]);
+  return vel;
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Ambient orb — huge blurred blob that drifts with scroll colour
-// ─────────────────────────────────────────────────────────────────────
-const ORB_COLORS = [
-  { pos: 0,    color: 'rgba(255,90,0,0.22)' },
-  { pos: 0.2,  color: 'rgba(200,60,0,0.18)' },
-  { pos: 0.45, color: 'rgba(0,100,140,0.15)' },
-  { pos: 0.7,  color: 'rgba(0,120,200,0.18)' },
-  { pos: 1.0,  color: 'rgba(14,120,220,0.20)' },
+// ─── Fixed background driven by scroll ───────────────────────────────
+function ScrollBg({ progress }: { progress: ReturnType<typeof useSpring> }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    return progress.on('change', (v) => {
+      if (ref.current) ref.current.style.background = bgAt(v);
+    });
+  }, [progress]);
+  return <div ref={ref} className="fixed inset-0 -z-20" style={{ background: bgAt(0) }} />;
+}
+
+// ─── Ambient gradient orb ─────────────────────────────────────────────
+const ORB = [
+  { p: 0.00, r: 160, g: 60,  b: 0   },
+  { p: 0.20, r: 140, g: 40,  b: 0   },
+  { p: 0.45, r: 10,  g: 90,  b: 130 },
+  { p: 0.70, r: 8,   g: 95,  b: 165 },
+  { p: 1.00, r: 10,  g: 90,  b: 170 },
 ];
-function interpolateOrb(p: number): string {
-  for (let i = 0; i < ORB_COLORS.length - 1; i++) {
-    const a = ORB_COLORS[i], b = ORB_COLORS[i + 1];
-    if (p >= a.pos && p <= b.pos) {
-      const t = (p - a.pos) / (b.pos - a.pos);
-      return lerpColor(a.color.replace(/rgba?\(/,'rgb(').replace(/,[^,)]+\)/,')'),
-                       b.color.replace(/rgba?\(/,'rgb(').replace(/,[^,)]+\)/,')'), t);
+function orbAt(p: number, alpha: number): string {
+  for (let i = 0; i < ORB.length - 1; i++) {
+    const a = ORB[i], b = ORB[i + 1];
+    if (p <= b.p) {
+      const t = (p - a.p) / (b.p - a.p);
+      const r = Math.round(a.r + (b.r - a.r) * t);
+      const g = Math.round(a.g + (b.g - a.g) * t);
+      const bl = Math.round(a.b + (b.b - a.b) * t);
+      return `radial-gradient(circle, rgba(${r},${g},${bl},${alpha}) 0%, transparent 70%)`;
     }
   }
-  return ORB_COLORS[ORB_COLORS.length - 1].color;
+  const last = ORB[ORB.length - 1];
+  return `radial-gradient(circle, rgba(${last.r},${last.g},${last.b},${alpha}) 0%, transparent 70%)`;
 }
 
 function AmbientOrb({ progress }: { progress: ReturnType<typeof useSpring> }) {
-  const y = useTransform(progress, [0, 1], ['10%', '75%']);
-  const x = useTransform(progress, [0, 0.5, 1], ['20%', '50%', '65%']);
-  const [orbColor, setOrbColor] = useState('rgba(255,90,0,0.22)');
-
+  const ref = useRef<HTMLDivElement>(null);
+  const top = useTransform(progress, [0, 1], ['5%', '72%']);
+  const left = useTransform(progress, [0, 0.5, 1], ['18%', '55%', '68%']);
   useEffect(() => {
-    return progress.on('change', (v) => setOrbColor(interpolateOrb(v)));
+    return progress.on('change', (v) => {
+      if (ref.current) ref.current.style.background = orbAt(v, 0.18);
+    });
   }, [progress]);
-
   return (
-    <motion.div
-      className="fixed -z-10 rounded-full pointer-events-none blur-3xl"
-      style={{
-        width: 700, height: 700,
-        top: y, left: x,
-        translateX: '-50%', translateY: '-50%',
-        background: `radial-gradient(circle, ${orbColor} 0%, transparent 70%)`,
-      }}
-    />
+    <motion.div ref={ref} className="fixed -z-10 rounded-full pointer-events-none"
+      style={{ width: 800, height: 800, top, left, translateX: '-50%', translateY: '-50%',
+               filter: 'blur(80px)', background: orbAt(0, 0.18) }} />
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Particles — rendered once, direction & colour morph via progress
-// ─────────────────────────────────────────────────────────────────────
-interface PData { id: number; cx: number; cy: number; size: number; delay: number; dur: number; tx: number; ty: number; }
+// ─── Brownian heat particles ──────────────────────────────────────────
+interface HotParticle {
+  id: number; x: number; y: number; size: number;
+  delay: number; dur: number; cls: 'a' | 'b' | 'c';
+  color: string;
+}
+const HOT_COLORS = ['rgba(251,146,60,0.7)', 'rgba(234,88,12,0.6)', 'rgba(253,186,116,0.5)', 'rgba(254,215,170,0.4)'];
 
-function Particles({ progress }: { progress: ReturnType<typeof useSpring> }) {
-  const count = 28;
-  const items: PData[] = useMemo(() => Array.from({ length: count }, (_, i) => ({
-    id: i,
-    cx: Math.random() * 100,
-    cy: 30 + Math.random() * 40,
-    size: 2 + Math.random() * 3,
-    delay: Math.random() * 6,
-    dur: 5 + Math.random() * 6,
-    tx: (Math.random() - 0.5) * 200,
-    ty: -(60 + Math.random() * 120),
-  })), []);
-
-  const [opacity, setOpacity] = useState(0);
-  const [colorProgress, setColorProgress] = useState(0);
-
-  useEffect(() => {
-    return progress.on('change', (v) => {
-      // particles fully visible between 0.25 and 0.75
-      const fade = v < 0.2 ? 0 : v < 0.35 ? (v - 0.2) / 0.15 : v > 0.8 ? 0 : 1;
-      setOpacity(fade);
-      setColorProgress(v);
-    });
-  }, [progress]);
-
-  const particleColor = colorProgress < 0.5
-    ? lerpColor('#f97316', '#94a3b8', colorProgress * 2)
-    : lerpColor('#94a3b8', '#38bdf8', (colorProgress - 0.5) * 2);
+function HeatParticles({ visible }: { visible: boolean }) {
+  const items: HotParticle[] = useMemo(() =>
+    Array.from({ length: 22 }, (_, i) => ({
+      id: i,
+      x: 10 + Math.random() * 80,
+      y: 60 + Math.random() * 30,
+      size: 1.5 + Math.random() * 2.5,
+      delay: Math.random() * 7,
+      dur: 6 + Math.random() * 5,
+      cls: (['a', 'b', 'c'] as const)[i % 3],
+      color: HOT_COLORS[Math.floor(Math.random() * HOT_COLORS.length)],
+    })), []);
 
   return (
-    <div className="fixed inset-0 -z-10 pointer-events-none" style={{ opacity }}>
+    <div className="fixed inset-0 -z-10 pointer-events-none"
+      style={{ opacity: visible ? 1 : 0, transition: 'opacity 1.2s ease' }}>
       {items.map((p) => (
-        <div
-          key={p.id}
-          className="particle absolute rounded-full"
+        <div key={p.id}
+          className={`particle-hot ${p.cls}`}
           style={{
-            left: `${p.cx}%`, top: `${p.cy}%`,
+            left: `${p.x}%`, bottom: `${100 - p.y}%`,
             width: p.size, height: p.size,
-            background: particleColor,
-            filter: 'blur(0.5px)',
-            '--tx': `${p.tx}px`, '--ty': `${p.ty}px`,
-            '--dur': `${p.dur}s`, '--delay': `${p.delay}s`,
-          } as React.CSSProperties}
-        />
+            background: p.color,
+            animationDuration: `${p.dur}s`,
+            animationDelay: `${p.delay}s`,
+            animation: `brownian${p.cls.toUpperCase()} ${p.dur}s ${p.delay}s ease-out infinite, particleFade ${p.dur}s ${p.delay}s ease-out infinite`,
+          }} />
       ))}
     </div>
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Wave SVG — undulates, shifts colour with scroll
-// ─────────────────────────────────────────────────────────────────────
-function WaveLayer({ progress }: { progress: ReturnType<typeof useSpring> }) {
-  const phase = useMotionValue(0);
-  const [opacity, setOpacity] = useState(0);
-
-  useAnimationFrame((t) => { phase.set(t / 1200); });
+// ─── Laminar flow canvas (cold zone) ─────────────────────────────────
+function LaminarCanvas({ opacity }: { opacity: number }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rafRef = useRef(0);
 
   useEffect(() => {
-    return progress.on('change', (v) => {
-      const fade = v < 0.3 ? 0 : v < 0.5 ? (v - 0.3) / 0.2 : v > 0.85 ? 0 : 1;
-      setOpacity(fade * 0.35);
-    });
-  }, [progress]);
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d')!;
+    const resize = () => { canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight; };
+    resize();
+    window.addEventListener('resize', resize);
 
-  const [d, setD] = useState('');
-  useAnimationFrame((t) => {
-    const p = t / 1200;
-    const pts = Array.from({ length: 32 }, (_, i) => {
-      const x = (i / 31) * 1600;
-      const y = 60 + Math.sin(i * 0.5 + p) * 22 + Math.sin(i * 0.3 + p * 1.4) * 14;
-      return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
-    });
-    setD(pts.join(' '));
+    // N horizontal laminar lines, each slightly different y-speed
+    const N = 40;
+    const lines = Array.from({ length: N }, (_, i) => ({
+      y: (canvas.height / N) * i + canvas.height / N / 2,
+      phase: Math.random() * Math.PI * 2,
+      speed: 0.18 + Math.random() * 0.12,
+      alpha: 0.03 + Math.random() * 0.04,
+    }));
+
+    const draw = (ts: number) => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const t = ts * 0.001;
+      lines.forEach((l) => {
+        // Each line is a very thin horizontal gradient — 1px
+        const offset = Math.sin(t * l.speed + l.phase) * 6;
+        const grad = ctx.createLinearGradient(0, 0, canvas.width, 0);
+        grad.addColorStop(0, `rgba(125,210,248,0)`);
+        grad.addColorStop(0.1 + Math.sin(t * 0.2 + l.phase) * 0.05, `rgba(125,210,248,${l.alpha})`);
+        grad.addColorStop(0.9 + Math.cos(t * 0.15 + l.phase) * 0.05, `rgba(160,220,255,${l.alpha})`);
+        grad.addColorStop(1, `rgba(125,210,248,0)`);
+        ctx.beginPath();
+        ctx.moveTo(0, l.y + offset);
+        ctx.lineTo(canvas.width, l.y + offset);
+        ctx.strokeStyle = grad;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      });
+      rafRef.current = requestAnimationFrame(draw);
+    };
+    rafRef.current = requestAnimationFrame(draw);
+    return () => { cancelAnimationFrame(rafRef.current); window.removeEventListener('resize', resize); };
+  }, []);
+
+  return (
+    <canvas ref={canvasRef} className="fixed inset-0 -z-10 w-full h-full pointer-events-none"
+      style={{ opacity, transition: 'opacity 1.4s ease' }} />
+  );
+}
+
+// ─── Motion blur wrapper — applies vertical blur on fast scroll ───────
+function ScrollBlur({ children, className = '' }: { children: React.ReactNode; className?: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const vel = useScrollVelocity();
+  useAnimationFrame(() => {
+    const v = Math.abs(vel.get());
+    // blur ramps from 0 at v=0 to max 3px at v=2 px/ms
+    const blur = Math.min(3, v * 1.4).toFixed(2);
+    const scaleY = 1 + Math.min(0.008, v * 0.003);
+    if (ref.current) {
+      ref.current.style.filter = `blur(0px) blur(${blur}px)`;
+      ref.current.style.transform = `scaleY(${scaleY})`;
+    }
   });
-
-  const stroke = useTransform(progress, [0.25, 0.75], ['#fb923c', '#38bdf8']);
-  const [strokeColor, setStrokeColor] = useState('#fb923c');
-  useEffect(() => stroke.on('change', setStrokeColor), [stroke]);
-
-  return (
-    <div className="fixed inset-x-0 top-1/2 -translate-y-1/2 -z-10 pointer-events-none" style={{ opacity }}>
-      <svg viewBox="0 0 1600 120" preserveAspectRatio="none" className="w-full h-24">
-        <path d={d} fill="none" stroke={strokeColor} strokeWidth="1.5" strokeOpacity="0.6" />
-      </svg>
-    </div>
-  );
+  return <div ref={ref} className={className} style={{ willChange: 'filter, transform' }}>{children}</div>;
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// NAV
-// ─────────────────────────────────────────────────────────────────────
-function Nav({ progress }: { progress: ReturnType<typeof useSpring> }) {
-  const [scrolled, setScrolled] = useState(false);
-
-  useEffect(() => {
-    return progress.on('change', (v) => setScrolled(v > 0.04));
-  }, [progress]);
-
+// ─── Reveal ───────────────────────────────────────────────────────────
+function Reveal({ children, className = '', delay = 0, y = 40 }: {
+  children: React.ReactNode; className?: string; delay?: number; y?: number;
+}) {
   return (
-    <motion.nav
-      className="fixed top-0 inset-x-0 z-50 flex items-center justify-between px-6 md:px-12 py-6 transition-all duration-500"
-      animate={{ background: scrolled ? 'rgba(2,8,16,0.7)' : 'transparent', backdropFilter: scrolled ? 'blur(16px)' : 'blur(0px)' }}
-    >
-      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.5 }}
-        className="font-syne font-bold text-sm tracking-[0.2em] text-white/70 uppercase">
-        Airform
-      </motion.div>
-      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.7 }}
-        className="hidden md:flex items-center gap-10">
-        {['Experience', 'Services', 'Contact'].map((l) => (
-          <a key={l} href={`#${l.toLowerCase()}`}
-            className="font-inter text-[11px] tracking-[0.18em] text-white/35 uppercase hover:text-white/75 transition-colors duration-300">
-            {l}
-          </a>
-        ))}
-      </motion.div>
-      <motion.a initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.9 }}
-        href="#contact"
-        className="font-inter text-[11px] tracking-[0.18em] uppercase px-5 py-2.5 rounded-full border border-white/15 text-white/50 hover:border-white/35 hover:text-white/90 transition-all duration-300">
-        Get a quote
-      </motion.a>
-    </motion.nav>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// SECTION REVEAL — wraps any section content with a scroll-reveal
-// ─────────────────────────────────────────────────────────────────────
-function Reveal({ children, className = '', delay = 0 }: { children: React.ReactNode; className?: string; delay?: number }) {
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 50, filter: 'blur(8px)' }}
+    <motion.div initial={{ opacity: 0, y, filter: 'blur(6px)' }}
       whileInView={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
-      viewport={{ once: true, margin: '-10%' }}
-      transition={{ duration: 1.2, ease: [0.16, 1, 0.3, 1], delay }}
-      className={className}
-    >
+      viewport={{ once: true, margin: '-8%' }}
+      transition={{ duration: 1.1, ease: [0.16, 1, 0.3, 1], delay }}
+      className={className}>
       {children}
     </motion.div>
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// 1. HERO — heat
-// ─────────────────────────────────────────────────────────────────────
-function Hero() {
+// ─── Image wrapper with luminosity + zone tint ────────────────────────
+function ZonedImage({ src, alt, tintColor, className = '' }: {
+  src: string; alt: string; tintColor: string; className?: string;
+}) {
+  return (
+    <div className={`img-luminosity ${className}`}>
+      <img src={src} alt={alt} loading="lazy" />
+      <div className="tint" style={{ background: tintColor }} />
+    </div>
+  );
+}
+
+// ─── NAV ──────────────────────────────────────────────────────────────
+function Nav({ progress }: { progress: ReturnType<typeof useSpring> }) {
+  const [scrolled, setScrolled] = useState(false);
+  useEffect(() => progress.on('change', (v) => setScrolled(v > 0.03)), [progress]);
+
+  return (
+    <motion.nav className="fixed top-0 inset-x-0 z-50 flex items-center justify-between px-6 md:px-14 py-7"
+      animate={{
+        background: scrolled ? 'rgba(8,5,2,0.75)' : 'transparent',
+        backdropFilter: scrolled ? 'blur(18px)' : 'blur(0px)',
+      }}
+      transition={{ duration: 0.6 }}>
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.6 }}
+        className="font-playfair text-base tracking-[0.18em] text-white/60 italic">
+        Airform
+      </motion.div>
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.8 }}
+        className="hidden md:flex items-center gap-10">
+        {['Experience', 'Services', 'Contact'].map((l) => (
+          <a key={l} href={`#${l.toLowerCase()}`}
+            className="font-inter text-[10px] tracking-[0.22em] text-white/30 uppercase hover:text-white/65
+                       transition-colors duration-400">
+            {l}
+          </a>
+        ))}
+      </motion.div>
+      <motion.a initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 1 }}
+        href="#contact"
+        className="font-inter text-[10px] tracking-[0.2em] uppercase px-5 py-2.5 border border-white/15
+                   text-white/40 hover:border-white/30 hover:text-white/75 transition-all duration-400">
+        Quote
+      </motion.a>
+    </motion.nav>
+  );
+}
+
+// ─── HERO ─────────────────────────────────────────────────────────────
+function Hero({ progress }: { progress: ReturnType<typeof useSpring> }) {
   const ref = useRef<HTMLDivElement>(null);
   const { scrollYProgress } = useScroll({ target: ref, offset: ['start start', 'end start'] });
-  const y   = useTransform(scrollYProgress, [0, 1], ['0%', '20%']);
-  const op  = useTransform(scrollYProgress, [0, 0.75], [1, 0]);
+  const y  = useTransform(scrollYProgress, [0, 1], ['0%', '18%']);
+  const op = useTransform(scrollYProgress, [0, 0.8], [1, 0]);
+  const [hotVisible, setHotVisible] = useState(true);
+  useEffect(() => progress.on('change', (v) => setHotVisible(v < 0.28)), [progress]);
 
   return (
     <section ref={ref} className="relative h-screen flex flex-col items-center justify-center overflow-hidden">
+      <HeatParticles visible={hotVisible} />
 
-      {/* Heat haze overlay */}
-      <div className="heat-shimmer absolute inset-0 pointer-events-none"
-        style={{ background: 'radial-gradient(ellipse at 50% 80%, rgba(255,80,0,0.18) 0%, transparent 60%)' }} />
+      {/* Radiant horizon */}
+      <motion.div className="absolute inset-x-0 bottom-0 h-1/2 pointer-events-none"
+        animate={{ opacity: [0.5, 0.8, 0.5] }} transition={{ duration: 6, repeat: Infinity, ease: 'easeInOut' }}
+        style={{ background: 'radial-gradient(ellipse at 50% 100%, rgba(180,55,0,0.22) 0%, transparent 65%)' }} />
 
-      {/* Horizon glow */}
-      <motion.div className="absolute inset-x-0 bottom-0 h-64 pointer-events-none"
-        style={{ background: 'linear-gradient(to top, rgba(200,50,0,0.25), transparent)' }}
-        animate={{ opacity: [0.6, 1, 0.6] }} transition={{ duration: 5, repeat: Infinity }} />
-
-      {/* Temperature readout */}
-      <motion.div className="absolute top-28 right-8 md:right-16 font-syne text-right select-none"
-        initial={{ opacity: 0, x: 30 }} animate={{ opacity: 1, x: 0 }} transition={{ duration: 1, delay: 1.2 }}>
-        <div className="text-6xl md:text-8xl font-bold leading-none"
-          style={{ color: '#fb923c', textShadow: '0 0 80px rgba(255,100,0,0.6)' }}>38°</div>
-        <div className="font-inter text-xs tracking-[0.3em] text-orange-500/50 uppercase mt-1">Outdoor</div>
+      {/* Temperature data — right side */}
+      <motion.div className="absolute top-28 right-8 md:right-16 text-right select-none"
+        initial={{ opacity: 0, x: 24 }} animate={{ opacity: 1, x: 0 }} transition={{ duration: 1.2, delay: 1.4 }}>
+        <ScrollBlur>
+          <div className="font-playfair font-bold leading-none" style={{ fontSize: 'clamp(64px,10vw,96px)',
+            color: '#c85a10', filter: 'drop-shadow(0 4px 12px rgba(160,50,0,0.3))' }}>
+            38°
+          </div>
+        </ScrollBlur>
+        <div className="font-inter text-[10px] tracking-[0.3em] uppercase mt-2"
+          style={{ color: 'rgba(200,100,30,0.45)' }}>
+          Outdoor
+        </div>
       </motion.div>
 
+      {/* Main content */}
       <motion.div className="relative z-10 text-center px-6 max-w-4xl" style={{ y, opacity: op }}>
-        <motion.div initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 1.1, delay: 0.3, ease: [0.16, 1, 0.3, 1] }}
-          className="font-inter text-xs tracking-[0.35em] text-orange-400/55 uppercase mb-8">
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 1, delay: 0.4, ease: [0.16, 1, 0.3, 1] }}
+          className="font-inter text-[10px] tracking-[0.4em] uppercase mb-9"
+          style={{ color: 'rgba(200,120,40,0.5)' }}>
           Climate Engineering
         </motion.div>
 
-        <motion.h1
-          initial={{ opacity: 0, y: 40, filter: 'blur(12px)' }}
-          animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
-          transition={{ duration: 1.3, delay: 0.5, ease: [0.16, 1, 0.3, 1] }}
-          className="font-syne font-bold mb-8 leading-[1.06]"
-          style={{ fontSize: 'clamp(46px, 9vw, 110px)', color: '#fdf2e5', textShadow: '0 0 120px rgba(255,100,0,0.2)' }}>
-          Too hot to live
-          <br />
-          <span style={{ color: '#fb923c', textShadow: '0 0 60px rgba(251,113,33,0.6)' }}>comfortably?</span>
-        </motion.h1>
+        <ScrollBlur>
+          <motion.h1 initial={{ opacity: 0, y: 36, filter: 'blur(10px)' }}
+            animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
+            transition={{ duration: 1.4, delay: 0.6, ease: [0.16, 1, 0.3, 1] }}
+            className="heat-distort font-playfair font-bold leading-[1.06] mb-9"
+            style={{ fontSize: 'clamp(48px, 9.5vw, 112px)', color: '#f0e0cc',
+                     filter: 'drop-shadow(0 6px 24px rgba(120,40,0,0.25))' }}>
+            Too hot to live
+            <br />
+            <em style={{ color: '#c85a10', fontStyle: 'italic' }}>comfortably?</em>
+          </motion.h1>
+        </ScrollBlur>
 
-        <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 1, delay: 0.9 }}
-          className="font-inter text-base md:text-lg text-white/30 mb-12 max-w-sm mx-auto leading-relaxed">
+        <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 1, delay: 1 }}
+          className="font-inter text-sm text-white/28 mb-14 max-w-xs mx-auto leading-relaxed tracking-wide">
           Your indoor environment, completely reimagined.
         </motion.p>
 
-        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.9, delay: 1.1 }}
+        <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.9, delay: 1.2 }}
           className="flex flex-col sm:flex-row items-center justify-center gap-4">
-          <motion.a href="#experience"
-            whileHover={{ scale: 1.04, boxShadow: '0 0 40px rgba(251,113,33,0.4)' }}
-            whileTap={{ scale: 0.97 }}
-            className="px-8 py-4 rounded-full font-inter text-sm tracking-[0.15em] uppercase text-white transition-all duration-300"
-            style={{ background: 'linear-gradient(135deg, #ea580c, #c2410c)', border: '1px solid rgba(251,113,33,0.3)' }}>
+          <a href="#experience"
+            className="px-8 py-4 font-inter text-[11px] tracking-[0.22em] uppercase text-white/80
+                       border border-white/20 hover:border-white/45 hover:text-white transition-all duration-500
+                       hover:bg-white/5">
             Fix your indoor climate
-          </motion.a>
+          </a>
           <a href="#services"
-            className="font-inter text-[12px] tracking-[0.2em] text-white/30 uppercase hover:text-white/60 transition-colors duration-300">
+            className="font-inter text-[10px] tracking-[0.22em] text-white/25 uppercase
+                       hover:text-white/55 transition-colors duration-400">
             See how it works ↓
           </a>
         </motion.div>
       </motion.div>
 
-      {/* Bottom fade */}
-      <div className="absolute inset-x-0 bottom-0 h-40 pointer-events-none"
-        style={{ background: 'linear-gradient(to bottom, transparent, #1a0600)' }} />
+      {/* Bottom vignette */}
+      <div className="absolute inset-x-0 bottom-0 h-48 pointer-events-none"
+        style={{ background: 'linear-gradient(to bottom, transparent, #120800)' }} />
 
-      {/* Scroll indicator */}
-      <motion.div className="absolute bottom-10 left-1/2 -translate-x-1/2 flex flex-col items-center gap-2"
-        initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 2, duration: 1 }}>
-        <motion.div animate={{ y: [0, 10, 0] }} transition={{ duration: 2.5, repeat: Infinity, ease: 'easeInOut' }}
-          className="w-px h-14 bg-gradient-to-b from-orange-500/50 to-transparent" />
+      {/* Scroll cue */}
+      <motion.div className="absolute bottom-9 left-1/2 -translate-x-1/2"
+        initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 2.2 }}>
+        <motion.div animate={{ scaleY: [1, 1.4, 1], opacity: [0.4, 0.7, 0.4] }}
+          transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}
+          className="w-px h-12 mx-auto"
+          style={{ background: 'linear-gradient(to bottom, rgba(200,100,30,0.5), transparent)' }} />
       </motion.div>
     </section>
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// 2. TRANSITION — the world cools
-// ─────────────────────────────────────────────────────────────────────
+// ─── TRANSITION — heat dissolves ──────────────────────────────────────
 function TransitionSection() {
   const ref = useRef<HTMLDivElement>(null);
   const { scrollYProgress } = useScroll({ target: ref, offset: ['start end', 'end start'] });
-  const blurVal = useTransform(scrollYProgress, [0, 0.4, 0.7], [6, 2, 0]);
-  const filter  = useTransform(blurVal, (v) => `blur(${v}px)`);
+  const blur = useTransform(scrollYProgress, [0, 0.45, 0.75], [8, 2, 0]);
+  const blurStr = useTransform(blur, (v) => `blur(${v.toFixed(1)}px)`);
 
   return (
-    <section ref={ref} id="experience" className="relative min-h-screen flex items-center justify-center overflow-hidden">
-      {/* Separator gradient */}
-      <div className="absolute inset-x-0 top-0 h-48 pointer-events-none"
-        style={{ background: 'linear-gradient(to bottom, #1a0600, transparent)' }} />
+    <section ref={ref} id="experience" className="relative min-h-screen flex items-center overflow-hidden">
+      <div className="absolute inset-x-0 top-0 h-56 pointer-events-none"
+        style={{ background: 'linear-gradient(to bottom, #120800, transparent)' }} />
 
-      <div className="relative z-10 max-w-5xl mx-auto px-6 text-center py-32">
-        <Reveal>
-          <motion.div style={{ filter, color: 'rgba(200,160,100,0.5)', letterSpacing: '0.3em' }}
-            className="font-inter text-xs tracking-[0.35em] uppercase mb-8">
-            The transformation begins
-          </motion.div>
-        </Reveal>
+      <div className="relative z-10 max-w-5xl mx-auto px-6 md:px-14 py-36 w-full">
+        <div className="grid md:grid-cols-2 gap-20 items-center">
 
-        <Reveal delay={0.15}>
-          <h2 className="font-syne font-bold leading-[1.07] mb-10"
-            style={{ fontSize: 'clamp(38px, 7vw, 84px)', color: '#f5ece0' }}>
-            We bring balance
-            <br />
-            <span style={{ color: 'rgba(180,200,220,0.85)' }}>back to your space.</span>
-          </h2>
-        </Reveal>
+          {/* Left — text */}
+          <div>
+            <Reveal>
+              <motion.div style={{ filter: blurStr, color: 'rgba(190,150,90,0.45)' }}
+                className="font-inter text-[10px] tracking-[0.38em] uppercase mb-8">
+                The transformation begins
+              </motion.div>
+            </Reveal>
+            <Reveal delay={0.12}>
+              <ScrollBlur>
+                <h2 className="font-playfair font-bold leading-[1.07] mb-8"
+                  style={{ fontSize: 'clamp(38px, 6vw, 78px)', color: '#ede0cc',
+                           filter: 'drop-shadow(0 4px 16px rgba(60,30,5,0.2))' }}>
+                  We bring balance
+                  <br />
+                  <em className="font-playfair italic" style={{ color: '#8ab8cc' }}>back to your space.</em>
+                </h2>
+              </ScrollBlur>
+            </Reveal>
+            <Reveal delay={0.24}>
+              <p className="font-inter text-sm leading-relaxed max-w-sm"
+                style={{ color: 'rgba(220,200,175,0.38)' }}>
+                Precision-engineered air systems that dissolve the heat and replace it with something your body recognises as perfect.
+              </p>
+            </Reveal>
+          </div>
 
-        <Reveal delay={0.3}>
-          <p className="font-inter text-base text-white/30 max-w-md mx-auto leading-relaxed">
-            Precision-engineered air systems that dissolve the heat and replace it with something your body recognises as perfect.
-          </p>
-        </Reveal>
+          {/* Right — image with luminosity treatment */}
+          <Reveal delay={0.18} y={30}>
+            <ZonedImage
+              src="https://images.unsplash.com/photo-1585771724684-38269d6639fd?w=900&q=85&auto=format"
+              alt="HVAC installation"
+              tintColor="rgba(180,90,20,0.35)"
+              className="aspect-[4/5] rounded-sm"
+            />
+          </Reveal>
+        </div>
 
-        {/* Three floating values */}
-        <div className="mt-24 grid grid-cols-1 md:grid-cols-3 gap-6 md:gap-10">
+        {/* Process cards */}
+        <div className="mt-24 grid grid-cols-1 md:grid-cols-3 gap-5">
           {[
-            { num: '01', label: 'Assess', desc: 'We study your space, its sun exposure and heat load.' },
-            { num: '02', label: 'Engineer', desc: 'Every system is designed specifically for your building.' },
-            { num: '03', label: 'Transform', desc: 'Your environment changes completely, permanently.' },
+            { num: '01', label: 'Assess', desc: 'We study your space, its orientation and thermal load.' },
+            { num: '02', label: 'Engineer', desc: 'Every system is specified for your exact building.' },
+            { num: '03', label: 'Transform', desc: 'Your environment changes. Completely. Permanently.' },
           ].map((item, i) => (
             <Reveal key={item.num} delay={0.1 * i}>
-              <div className="p-7 rounded-2xl text-left"
-                style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.07)' }}>
-                <div className="font-inter text-xs tracking-[0.3em] mb-5" style={{ color: 'rgba(180,160,100,0.45)' }}>{item.num}</div>
-                <div className="font-syne font-bold text-2xl text-white/80 mb-3">{item.label}</div>
-                <div className="font-inter text-sm text-white/35 leading-relaxed">{item.desc}</div>
+              <div className="p-7 border-t border-white/8 group hover:border-white/16 transition-colors duration-500">
+                <div className="font-inter text-[10px] tracking-[0.3em] mb-5"
+                  style={{ color: 'rgba(180,140,80,0.4)' }}>{item.num}</div>
+                <div className="font-playfair font-bold text-xl mb-3"
+                  style={{ color: '#e8d8c0' }}>{item.label}</div>
+                <div className="font-inter text-sm leading-relaxed"
+                  style={{ color: 'rgba(210,190,160,0.38)' }}>{item.desc}</div>
               </div>
             </Reveal>
           ))}
@@ -401,114 +452,86 @@ function TransitionSection() {
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// 3. AIRFLOW EXPERIENCE
-// ─────────────────────────────────────────────────────────────────────
-function AirflowSection() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const animRef   = useRef<number>(0);
-  const timeRef   = useRef(0);
-
+// ─── AIRFLOW — laminar canvas ─────────────────────────────────────────
+function AirflowSection({ progress }: { progress: ReturnType<typeof useSpring> }) {
+  const [laminarOpacity, setLaminarOpacity] = useState(0);
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d')!;
-
-    const resize = () => { canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight; };
-    resize();
-    window.addEventListener('resize', resize);
-
-    const N = 6;
-    const lines = Array.from({ length: N }, (_, i) => ({
-      yBase: (canvas.height * (i + 1)) / (N + 1),
-      phase: (i / N) * Math.PI * 2,
-      amp: 24 + i * 8,
-      freq: 0.003 + i * 0.0008,
-      speed: 0.3 + i * 0.06,
-    }));
-
-    const draw = (ts: number) => {
-      const dt = ts - timeRef.current;
-      timeRef.current = ts;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      lines.forEach((l, li) => {
-        const alpha = 0.08 + li * 0.03;
-        const hue = 190 + li * 8;
-        ctx.beginPath();
-        for (let x = 0; x <= canvas.width; x += 4) {
-          const y = l.yBase + Math.sin(x * l.freq + ts * 0.0005 * l.speed + l.phase) * l.amp
-                             + Math.sin(x * l.freq * 1.7 + ts * 0.0004 + l.phase * 1.3) * (l.amp * 0.4);
-          x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-        }
-        ctx.strokeStyle = `hsla(${hue}, 80%, 70%, ${alpha})`;
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-      });
-
-      animRef.current = requestAnimationFrame(draw);
-    };
-
-    animRef.current = requestAnimationFrame(draw);
-    return () => {
-      cancelAnimationFrame(animRef.current);
-      window.removeEventListener('resize', resize);
-    };
-  }, []);
+    return progress.on('change', (v) => {
+      const fade = v < 0.38 ? 0 : v < 0.55 ? (v - 0.38) / 0.17 : v > 0.82 ? (0.82 - v) / 0.1 : 1;
+      setLaminarOpacity(clamp01(fade) * 0.9);
+    });
+  }, [progress]);
 
   return (
     <section className="relative min-h-screen flex items-center overflow-hidden">
-      {/* Canvas airflow */}
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
+      <LaminarCanvas opacity={laminarOpacity} />
 
-      {/* Cool atmosphere overlay */}
-      <div className="absolute inset-0 pointer-events-none"
-        style={{ background: 'radial-gradient(ellipse at 50% 50%, rgba(14,120,200,0.09) 0%, transparent 70%)' }} />
+      <div className="relative z-10 max-w-6xl mx-auto px-6 md:px-14 py-36 w-full">
+        <div className="grid md:grid-cols-2 gap-20 items-center">
 
-      <div className="relative z-10 max-w-5xl mx-auto px-6 w-full py-32">
-        <div className="grid md:grid-cols-2 gap-16 items-center">
-          <div>
+          {/* Stats col */}
+          <div className="grid grid-cols-2 gap-4 order-2 md:order-1">
+            {[
+              { value: '0.1°C', label: 'Precision',    note: 'temperature accuracy' },
+              { value: '19 dB', label: 'Near-silent',  note: 'operating noise floor' },
+              { value: 'A+++',  label: 'Efficiency',   note: 'EU energy classification' },
+              { value: '< 4h',  label: 'Installed',    note: 'average fit duration' },
+            ].map((s, i) => (
+              <Reveal key={s.value} delay={i * 0.09}>
+                <div className="p-6 border border-white/7 hover:border-white/14 transition-colors duration-500">
+                  <ScrollBlur>
+                    <div className="font-playfair font-bold mb-1"
+                      style={{ fontSize: 'clamp(26px,3.5vw,34px)', color: '#a8c8d8',
+                               filter: 'drop-shadow(0 2px 8px rgba(10,80,120,0.25))' }}>
+                      {s.value}
+                    </div>
+                  </ScrollBlur>
+                  <div className="font-inter text-xs font-medium mb-0.5" style={{ color: 'rgba(185,215,230,0.6)' }}>
+                    {s.label}
+                  </div>
+                  <div className="font-inter text-[10px]" style={{ color: 'rgba(160,195,215,0.3)' }}>
+                    {s.note}
+                  </div>
+                </div>
+              </Reveal>
+            ))}
+          </div>
+
+          {/* Text col */}
+          <div className="order-1 md:order-2">
             <Reveal>
-              <div className="font-inter text-xs tracking-[0.35em] uppercase mb-7"
-                style={{ color: 'rgba(100,180,220,0.5)', letterSpacing: '0.3em' }}>
+              <div className="font-inter text-[10px] tracking-[0.38em] uppercase mb-7"
+                style={{ color: 'rgba(100,165,200,0.45)' }}>
                 Air in motion
               </div>
             </Reveal>
             <Reveal delay={0.1}>
-              <h2 className="font-syne font-bold leading-[1.06] mb-8"
-                style={{ fontSize: 'clamp(36px, 6vw, 72px)', color: '#e0f0ff' }}>
-                Feel the
-                <br />
-                <span style={{ color: '#38bdf8', textShadow: '0 0 60px rgba(56,189,248,0.35)' }}>air shift.</span>
-              </h2>
+              <ScrollBlur>
+                <h2 className="font-playfair font-bold leading-[1.06] mb-8"
+                  style={{ fontSize: 'clamp(36px, 5.5vw, 68px)', color: '#d8eaf4',
+                           filter: 'drop-shadow(0 4px 18px rgba(8,70,110,0.2))' }}>
+                  Feel the
+                  <br />
+                  <em className="font-playfair italic" style={{ color: '#7db8d0' }}>air shift.</em>
+                </h2>
+              </ScrollBlur>
             </Reveal>
             <Reveal delay={0.2}>
-              <p className="font-inter text-sm text-white/35 leading-relaxed max-w-sm">
-                Precision airflow delivery — every cubic metre of your space reaches the exact temperature you set. Silently. Continuously.
+              <p className="font-inter text-sm leading-relaxed max-w-sm"
+                style={{ color: 'rgba(190,220,235,0.38)' }}>
+                Precision laminar flow — every cubic metre of your space reaches the exact temperature you set. Silently. Continuously.
               </p>
             </Reveal>
-          </div>
 
-          {/* Stats */}
-          <div className="grid grid-cols-2 gap-4">
-            {[
-              { value: '0.1°', label: 'Precision', unit: 'temperature accuracy' },
-              { value: '19dB', label: 'Near-silent', unit: 'operating noise' },
-              { value: 'A+++', label: 'Efficiency', unit: 'energy rating' },
-              { value: '<4h', label: 'Installed', unit: 'typical fit time' },
-            ].map((s, i) => (
-              <Reveal key={s.value} delay={i * 0.08}>
-                <div className="p-6 rounded-2xl"
-                  style={{ background: 'rgba(56,189,248,0.05)', border: '1px solid rgba(56,189,248,0.12)' }}>
-                  <div className="font-syne font-bold text-3xl mb-1"
-                    style={{ color: '#7dd3fc', textShadow: '0 0 30px rgba(56,189,248,0.3)' }}>
-                    {s.value}
-                  </div>
-                  <div className="font-inter font-medium text-sm text-white/60 mb-0.5">{s.label}</div>
-                  <div className="font-inter text-xs text-white/25">{s.unit}</div>
-                </div>
-              </Reveal>
-            ))}
+            {/* Image — steel blue tint */}
+            <Reveal delay={0.3} y={20}>
+              <ZonedImage
+                src="https://images.unsplash.com/photo-1631367075396-c8e1b9c0dfd7?w=800&q=85&auto=format"
+                alt="Heat pump unit"
+                tintColor="rgba(20,80,130,0.45)"
+                className="mt-10 aspect-video rounded-sm"
+              />
+            </Reveal>
           </div>
         </div>
       </div>
@@ -516,57 +539,63 @@ function AirflowSection() {
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// 4. COOL COMFORT
-// ─────────────────────────────────────────────────────────────────────
+// ─── COOL COMFORT ─────────────────────────────────────────────────────
 function CoolSection() {
   return (
     <section className="relative min-h-screen flex items-center justify-center overflow-hidden">
-      {/* Cool orb */}
+      {/* Soft cool atmosphere */}
       <div className="absolute inset-0 pointer-events-none"
-        style={{ background: 'radial-gradient(ellipse at 50% 60%, rgba(14,165,233,0.14) 0%, transparent 65%)' }} />
+        style={{ background: 'radial-gradient(ellipse at 50% 55%, rgba(10,90,150,0.12) 0%, transparent 65%)' }} />
 
-      <div className="relative z-10 text-center px-6 max-w-5xl mx-auto py-32">
-        {/* Large temp reading */}
+      <div className="relative z-10 text-center px-6 max-w-5xl mx-auto py-36">
         <Reveal>
-          <div className="font-syne font-bold mb-4 select-none"
-            style={{
-              fontSize: 'clamp(100px, 22vw, 240px)', lineHeight: 1,
-              color: 'transparent',
-              WebkitTextStroke: '1px rgba(56,189,248,0.25)',
-              textShadow: '0 0 120px rgba(14,165,233,0.12)',
-            }}>
-            21°
-          </div>
+          {/* Ghost temperature numeral — steel stroke only */}
+          <ScrollBlur>
+            <div className="font-playfair font-bold select-none leading-none mb-6"
+              style={{
+                fontSize: 'clamp(110px, 22vw, 240px)',
+                color: 'transparent',
+                WebkitTextStroke: '1px rgba(80,160,200,0.18)',
+                filter: 'drop-shadow(0 8px 40px rgba(10,80,140,0.08))',
+              }}>
+              21°
+            </div>
+          </ScrollBlur>
         </Reveal>
 
         <Reveal delay={0.15}>
-          <h2 className="font-syne font-bold leading-[1.06] mb-8"
-            style={{ fontSize: 'clamp(36px, 6.5vw, 80px)', color: '#dff2ff' }}>
-            Perfect temperature.
-            <br />
-            <span style={{ color: '#38bdf8', textShadow: '0 0 60px rgba(56,189,248,0.4)' }}>Perfect comfort.</span>
-          </h2>
+          <ScrollBlur>
+            <h2 className="font-playfair font-bold leading-[1.06] mb-8"
+              style={{ fontSize: 'clamp(36px, 6vw, 76px)', color: '#d0e8f5',
+                       filter: 'drop-shadow(0 4px 20px rgba(8,60,100,0.18))' }}>
+              Perfect temperature.
+              <br />
+              <em className="italic" style={{ color: '#7ab4cc' }}>Perfect comfort.</em>
+            </h2>
+          </ScrollBlur>
         </Reveal>
 
         <Reveal delay={0.25}>
-          <p className="font-inter text-base text-white/30 max-w-md mx-auto leading-relaxed mb-16">
+          <p className="font-inter text-sm leading-relaxed max-w-md mx-auto mb-16"
+            style={{ color: 'rgba(175,210,230,0.38)' }}>
             The moment your system reaches its target, the world becomes quieter. Cleaner. Yours.
           </p>
         </Reveal>
 
-        {/* Testimonial */}
+        {/* Testimonial — mat card, no glow */}
         <Reveal delay={0.35}>
-          <div className="mx-auto max-w-lg p-8 rounded-3xl"
-            style={{ background: 'rgba(56,189,248,0.06)', border: '1px solid rgba(56,189,248,0.12)' }}>
-            <p className="font-inter text-sm text-white/50 italic leading-relaxed mb-5">
-              "The first night after the install, I slept eight hours straight for the first time in three summers."
+          <div className="mx-auto max-w-lg p-9 border border-white/7"
+            style={{ background: 'rgba(255,255,255,0.025)' }}>
+            <p className="font-playfair italic text-base leading-relaxed mb-6"
+              style={{ color: 'rgba(195,225,240,0.55)' }}>
+              "The first night after the install, I slept eight hours straight — for the first time in three summers."
             </p>
             <div className="flex items-center gap-3 justify-center">
-              <div className="w-8 h-8 rounded-full" style={{ background: 'rgba(56,189,248,0.2)' }} />
+              <div className="w-8 h-8 rounded-full border border-white/10"
+                style={{ background: 'rgba(60,120,160,0.2)' }} />
               <div className="text-left">
-                <div className="font-inter text-xs text-white/50 font-medium">Claire M.</div>
-                <div className="font-inter text-[10px] text-white/25">Paris, 6th arrondissement</div>
+                <div className="font-inter text-xs" style={{ color: 'rgba(190,220,235,0.5)' }}>Claire M.</div>
+                <div className="font-inter text-[10px]" style={{ color: 'rgba(160,200,220,0.25)' }}>Paris, 6th arrondissement</div>
               </div>
             </div>
           </div>
@@ -576,85 +605,68 @@ function CoolSection() {
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// 5. SERVICES
-// ─────────────────────────────────────────────────────────────────────
+// ─── SERVICES ─────────────────────────────────────────────────────────
 const SERVICES = [
-  {
-    label: 'Installation',
-    desc: 'Full system design and installation. We handle everything from load assessment to commissioning.',
-    detail: 'Split, multi-split, ducted, heat pump',
-    color: '#38bdf8',
-  },
-  {
-    label: 'Repair',
-    desc: 'Rapid diagnostics and same-day repairs. Certified engineers with all major brand parts.',
-    detail: 'Same-day availability',
-    color: '#34d399',
-  },
-  {
-    label: 'Maintenance',
-    desc: 'Annual servicing contracts that double system lifespan and keep energy use at its minimum.',
-    detail: 'Annual contracts from €180',
-    color: '#a78bfa',
-  },
+  { label: 'Installation', desc: 'Full system design and installation. Load assessment to commissioning.', detail: 'Split · Multi-split · Ducted · Heat pump', accent: '#8ab0c0' },
+  { label: 'Repair',       desc: 'Rapid diagnostics and same-day repairs. Certified engineers, all major brands.', detail: 'Same-day availability', accent: '#90b8a0' },
+  { label: 'Maintenance',  desc: 'Annual servicing contracts that double system lifespan, minimise energy draw.', detail: 'Annual contracts from €180', accent: '#a090b8' },
 ];
 
 function ServicesSection() {
   return (
-    <section id="services" className="relative py-28 md:py-36 overflow-hidden">
-      <div className="absolute inset-0 pointer-events-none"
-        style={{ background: 'radial-gradient(ellipse at 40% 50%, rgba(14,120,180,0.07) 0%, transparent 70%)' }} />
-
-      <div className="relative z-10 max-w-6xl mx-auto px-6">
+    <section id="services" className="relative py-32 md:py-44 overflow-hidden">
+      <div className="max-w-6xl mx-auto px-6 md:px-14">
         <Reveal>
-          <div className="font-inter text-xs tracking-[0.35em] uppercase mb-5" style={{ color: 'rgba(100,180,220,0.45)' }}>
-            Services
-          </div>
+          <div className="font-inter text-[10px] tracking-[0.38em] uppercase mb-5"
+            style={{ color: 'rgba(120,175,200,0.4)' }}>Services</div>
         </Reveal>
         <Reveal delay={0.1}>
-          <h2 className="font-syne font-bold mb-16"
-            style={{ fontSize: 'clamp(34px, 6vw, 72px)', lineHeight: 1.07, color: '#ddeeff' }}>
-            Everything your
-            <br />space needs.
-          </h2>
+          <ScrollBlur>
+            <h2 className="font-playfair font-bold mb-20"
+              style={{ fontSize: 'clamp(34px, 5.5vw, 68px)', lineHeight: 1.06, color: '#d8ecf8',
+                       filter: 'drop-shadow(0 4px 18px rgba(8,55,90,0.15))' }}>
+              Everything your
+              <br /><em className="italic">space needs.</em>
+            </h2>
+          </ScrollBlur>
         </Reveal>
 
-        <div className="grid md:grid-cols-3 gap-5">
+        {/* Service rows — horizontal divider style */}
+        <div className="space-y-0">
           {SERVICES.map((s, i) => (
-            <Reveal key={s.label} delay={i * 0.12}>
-              <motion.div
-                whileHover={{ scale: 1.025, borderColor: `${s.color}40` }}
-                className="group p-8 rounded-2xl cursor-default transition-all duration-400"
-                style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}>
-                <div className="w-10 h-10 rounded-xl flex items-center justify-center mb-6"
-                  style={{ background: `${s.color}15`, border: `1px solid ${s.color}25` }}>
-                  <div className="w-2.5 h-2.5 rounded-full" style={{ background: s.color, boxShadow: `0 0 10px ${s.color}` }} />
+            <Reveal key={s.label} delay={i * 0.1}>
+              <div className="group py-9 border-t border-white/7 hover:border-white/14 transition-colors duration-500
+                              grid md:grid-cols-[1fr_2fr_1fr] gap-8 items-start">
+                <div>
+                  <div className="font-inter text-[10px] tracking-[0.3em] mb-3"
+                    style={{ color: 'rgba(160,185,200,0.35)' }}>0{i + 1}</div>
+                  <div className="font-playfair font-bold text-2xl"
+                    style={{ color: s.accent }}>{s.label}</div>
                 </div>
-                <h3 className="font-syne font-bold text-2xl text-white/80 mb-4 group-hover:text-white/95 transition-colors">{s.label}</h3>
-                <p className="font-inter text-sm text-white/35 leading-relaxed mb-6">{s.desc}</p>
-                <div className="font-inter text-[11px] tracking-[0.15em] uppercase"
-                  style={{ color: `${s.color}70` }}>
-                  {s.detail}
-                </div>
-              </motion.div>
+                <div className="font-inter text-sm leading-relaxed"
+                  style={{ color: 'rgba(200,220,235,0.38)' }}>{s.desc}</div>
+                <div className="font-inter text-[10px] tracking-[0.18em] uppercase text-right"
+                  style={{ color: 'rgba(160,190,210,0.3)' }}>{s.detail}</div>
+              </div>
             </Reveal>
           ))}
+          <div className="border-t border-white/7" />
         </div>
 
         {/* Guarantees */}
-        <div className="mt-14 grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="mt-16 grid grid-cols-2 md:grid-cols-4 gap-5">
           {[
-            { v: '5yr', l: 'Parts warranty' },
-            { v: '4.9★', l: '180+ reviews' },
-            { v: 'RGE', l: 'Certified' },
-            { v: '24h', l: 'Emergency response' },
+            { v: '5 yr',  l: 'Parts warranty' },
+            { v: '4.9',   l: '180+ verified reviews' },
+            { v: 'RGE',   l: 'Certified installer' },
+            { v: '< 4h',  l: 'Emergency response' },
           ].map((g, i) => (
             <Reveal key={g.v} delay={i * 0.07}>
-              <div className="text-center py-5 px-4 rounded-xl"
-                style={{ background: 'rgba(56,189,248,0.04)', border: '1px solid rgba(56,189,248,0.1)' }}>
-                <div className="font-syne font-bold text-2xl text-sky-400/80 mb-1">{g.v}</div>
-                <div className="font-inter text-xs text-white/30">{g.l}</div>
+              <div className="py-6 px-5 border border-white/6 text-center hover:border-white/12 transition-colors duration-500">
+                <div className="font-playfair font-bold text-xl mb-1"
+                  style={{ color: '#8ab8cc' }}>{g.v}</div>
+                <div className="font-inter text-[10px] tracking-wide"
+                  style={{ color: 'rgba(160,200,220,0.3)' }}>{g.l}</div>
               </div>
             </Reveal>
           ))}
@@ -664,52 +676,52 @@ function ServicesSection() {
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// 6. FINAL CTA
-// ─────────────────────────────────────────────────────────────────────
+// ─── FINAL CTA ────────────────────────────────────────────────────────
 function CTASection() {
   return (
-    <section id="contact" className="relative py-40 md:py-56 overflow-hidden">
-      {/* Deep cool atmosphere */}
+    <section id="contact" className="relative py-44 md:py-60 overflow-hidden">
+      {/* Subtle deep pool */}
       <div className="absolute inset-0 pointer-events-none"
-        style={{ background: 'radial-gradient(ellipse at 50% 55%, rgba(14,120,220,0.18) 0%, transparent 65%)' }} />
+        style={{ background: 'radial-gradient(ellipse at 50% 60%, rgba(10,75,140,0.14) 0%, transparent 65%)' }} />
 
-      {/* Rings */}
-      {[500, 780, 1060].map((r, i) => (
-        <motion.div key={r} className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full pointer-events-none"
-          animate={{ scale: [1, 1.03 + i * 0.01, 1], opacity: [0.12 - i * 0.03, 0.22 - i * 0.03, 0.12 - i * 0.03] }}
-          transition={{ duration: 6 + i * 2.5, repeat: Infinity, delay: i * 1.2 }}
-          style={{ width: r, height: r, border: '1px solid rgba(56,189,248,0.18)' }} />
+      {/* Hairline rings — mat, no glow */}
+      {[440, 680, 920].map((r, i) => (
+        <motion.div key={r}
+          className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full pointer-events-none"
+          animate={{ opacity: [0.06 + i * 0.01, 0.12 + i * 0.01, 0.06 + i * 0.01] }}
+          transition={{ duration: 7 + i * 2, repeat: Infinity, delay: i * 1.5 }}
+          style={{ width: r, height: r, border: '1px solid rgba(100,170,210,0.2)' }} />
       ))}
 
       <div className="relative z-10 max-w-3xl mx-auto px-6 text-center">
         <Reveal>
-          <div className="inline-flex items-center gap-2.5 mb-8 px-4 py-2 rounded-full"
-            style={{ background: 'rgba(56,189,248,0.07)', border: '1px solid rgba(56,189,248,0.18)' }}>
-            <motion.div className="w-1.5 h-1.5 rounded-full bg-sky-400"
-              animate={{ opacity: [1, 0.3, 1] }} transition={{ duration: 2, repeat: Infinity }} />
-            <span className="font-inter text-xs tracking-[0.2em] uppercase" style={{ color: 'rgba(125,210,248,0.65)' }}>
+          <div className="inline-flex items-center gap-2.5 mb-9 px-5 py-2.5 border border-white/10"
+            style={{ background: 'rgba(255,255,255,0.025)' }}>
+            <motion.div className="w-1.5 h-1.5 rounded-full"
+              style={{ background: '#7ab4cc' }}
+              animate={{ opacity: [1, 0.25, 1] }} transition={{ duration: 2.5, repeat: Infinity }} />
+            <span className="font-inter text-[10px] tracking-[0.28em] uppercase"
+              style={{ color: 'rgba(140,195,220,0.6)' }}>
               Available today
             </span>
           </div>
         </Reveal>
 
         <Reveal delay={0.1}>
-          <h2 className="font-syne font-bold leading-[1.05] mb-7"
-            style={{ fontSize: 'clamp(42px, 8vw, 92px)', color: '#dff2ff' }}>
-            Upgrade your
-            <br />
-            <motion.span
-              style={{ color: '#38bdf8', display: 'inline-block' }}
-              animate={{ textShadow: ['0 0 40px rgba(56,189,248,0.3)', '0 0 80px rgba(56,189,248,0.55)', '0 0 40px rgba(56,189,248,0.3)'] }}
-              transition={{ duration: 5, repeat: Infinity }}>
-              comfort today.
-            </motion.span>
-          </h2>
+          <ScrollBlur>
+            <h2 className="font-playfair font-bold leading-[1.05] mb-7"
+              style={{ fontSize: 'clamp(44px, 8vw, 90px)', color: '#d0e8f5',
+                       filter: 'drop-shadow(0 6px 28px rgba(8,55,100,0.18))' }}>
+              Upgrade your
+              <br />
+              <em className="italic" style={{ color: '#7ab4cc' }}>comfort today.</em>
+            </h2>
+          </ScrollBlur>
         </Reveal>
 
         <Reveal delay={0.2}>
-          <p className="font-inter text-sm text-white/35 max-w-sm mx-auto leading-relaxed mb-12">
+          <p className="font-inter text-sm leading-relaxed max-w-xs mx-auto mb-12"
+            style={{ color: 'rgba(180,215,232,0.38)' }}>
             Free site survey. No obligation. We'll tell you exactly what your space needs.
           </p>
         </Reveal>
@@ -717,14 +729,17 @@ function CTASection() {
         <Reveal delay={0.3}>
           <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
             <motion.a href="tel:+33123456789"
-              whileHover={{ scale: 1.05, boxShadow: '0 0 60px rgba(56,189,248,0.35)' }}
-              whileTap={{ scale: 0.97 }}
-              className="px-10 py-5 rounded-full font-inter text-sm tracking-[0.15em] uppercase text-slate-950 font-medium transition-all duration-300"
-              style={{ background: 'linear-gradient(135deg, #38bdf8, #0ea5e9)' }}>
+              whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}
+              className="px-10 py-5 font-inter text-[11px] tracking-[0.22em] uppercase
+                         transition-all duration-500 text-slate-950"
+              style={{ background: 'rgba(175,215,235,0.95)',
+                       boxShadow: '0 4px 24px rgba(10,70,120,0.2)' }}>
               Get a free quote
             </motion.a>
             <a href="tel:+33123456789"
-              className="font-inter text-sm text-white/35 tracking-wider hover:text-white/65 transition-colors">
+              className="font-inter text-[10px] tracking-[0.2em] uppercase
+                         transition-colors duration-400"
+              style={{ color: 'rgba(160,200,220,0.4)' }}>
               or call 01 23 45 67 89
             </a>
           </div>
@@ -732,10 +747,11 @@ function CTASection() {
 
         <Reveal delay={0.45}>
           <div className="mt-14 flex flex-wrap justify-center gap-8">
-            {['RGE Certified', '5-Year Warranty', 'Same-day repair', '4.9★ Google'].map((b) => (
+            {['RGE Certified', '5-Year Warranty', 'Same-day repair', '4.9 Google'].map((b) => (
               <div key={b} className="flex items-center gap-2">
-                <div className="w-1 h-1 rounded-full bg-sky-400/40" />
-                <span className="font-inter text-xs text-white/25 tracking-[0.12em]">{b}</span>
+                <div className="w-px h-3" style={{ background: 'rgba(120,180,210,0.25)' }} />
+                <span className="font-inter text-[10px] tracking-[0.15em]"
+                  style={{ color: 'rgba(160,205,225,0.28)' }}>{b}</span>
               </div>
             ))}
           </div>
@@ -745,41 +761,38 @@ function CTASection() {
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// FOOTER
-// ─────────────────────────────────────────────────────────────────────
+// ─── FOOTER ───────────────────────────────────────────────────────────
 function Footer() {
   return (
-    <footer className="relative py-12 px-6" style={{ borderTop: '1px solid rgba(56,189,248,0.06)', background: '#010509' }}>
-      <div className="max-w-6xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
-        <div className="font-syne font-bold text-sm tracking-[0.2em] text-white/20 uppercase">Airform</div>
-        <p className="font-inter text-xs text-white/20">© 2025 Airform Climate Engineering. All rights reserved.</p>
-        <p className="font-inter text-xs text-white/15">RGE Certified · Lic. HV-448821</p>
+    <footer className="relative py-10 px-6 md:px-14"
+      style={{ borderTop: '1px solid rgba(100,160,200,0.07)', background: '#020810' }}>
+      <div className="max-w-6xl mx-auto flex flex-col md:flex-row items-center justify-between gap-3">
+        <div className="font-playfair italic text-sm" style={{ color: 'rgba(140,180,205,0.25)' }}>Airform</div>
+        <p className="font-inter text-[10px]" style={{ color: 'rgba(140,175,200,0.2)' }}>
+          © 2025 Airform Climate Engineering. All rights reserved.
+        </p>
+        <p className="font-inter text-[10px]" style={{ color: 'rgba(120,160,185,0.15)' }}>
+          RGE Certified · Lic. HV-448821
+        </p>
       </div>
     </footer>
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// APP
-// ─────────────────────────────────────────────────────────────────────
+// ─── APP ──────────────────────────────────────────────────────────────
 export default function App() {
   const progress = usePageScroll();
 
   return (
     <>
-      {/* Fixed environmental layers */}
-      <ScrollBackground progress={progress} />
+      <ScrollBg progress={progress} />
       <AmbientOrb progress={progress} />
-      <Particles progress={progress} />
-      <WaveLayer progress={progress} />
 
-      {/* Page */}
       <div className="relative">
         <Nav progress={progress} />
-        <Hero />
+        <Hero progress={progress} />
         <TransitionSection />
-        <AirflowSection />
+        <AirflowSection progress={progress} />
         <CoolSection />
         <ServicesSection />
         <CTASection />
